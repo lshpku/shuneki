@@ -35,42 +35,44 @@
     * Listen(network, address string) (Listener, error)
     * ListenSocks(network, address string) (Listener, error)
 * sla
-    * IncTimeout(err error)
-    * IncConn(connId uint32, total int)
-    * DecConn(connId uint32, total int)
-    * IncSess(connId uint32, sessId uint16, addr string, total int)
-    * DecSess(connId uint32, sessId uint16, addr string, total int)
+    * Info(format string, a ...interface{})
+    * Warn(format string, a ...interface{})
+    * Error(format string, a ...interface{})
+    * Fatal(format string, a ...interface{})
 
 ## 命令行参数
-```
--server.net
--server.addr
--client.net
--client.addr
+```conf
+-server.net = "tcp"
+-server.addr = ""
+-client.net = "tcp"
+-client.addr = ""
 -remux.reuse.max.sec = 60   使用时间达到该时长的连接不可重用
 -remux.reuse.max.cnt = 16   重用次数达到该数量的连接不可重用
--remux.idle.max.sec  = 10   闲置超过该时长的连接需要关闭
--remux.conn.max.cnt  = 1024 不可超过该连接数
--tls.server.key
--tls.server.cert
--tls.client.ca
--tls.client.key
--tls.client.cert
--sla.dingtalk.token
--sla.dingtalk.secret
+-remux.idle.max.sec = 10    闲置达到该时长的连接需要关闭
+-remux.conn.max.cnt = 1024  同一时刻不可超过该连接数
+-remux.net = "tls"          ReMux底层连接类型, 必须是net支持类型或"tls"
+-eagersocks.net = "remux"   EagerSocks底层连接类型, 必须是net支持类型, "tls"或"remux"
+-tls.server.key = ""
+-tls.server.cert = ""
+-tls.client.ca = ""
+-tls.client.key = ""
+-tls.client.cert = ""
+-sla.log.level = "info"
+-sla.log.path = "/var/log/tunnels.log"
+-sla.dingtalk.token = ""
+-sla.dingtalk.secret = ""
 ```
 
 ## 日志格式
 ```
-CONN + 84ad76fb = 8
-SESS + 84ad76fb:1 google.com:443 = 1
-SESS + 3321d0e6:9 youtube.com:443 = 4
-SESS + 84ad76fb:2 yahoo.com:80 = 2
-SESS - 84ad76fb:1 google.com:443 = 1
-SESS - 84ad76fb:2 yahoo.com:80 = 0
-CONN - 84ad76fb = 7
+2020.09.01 17:15:07 [info] [conn] + 8f7ed46a = 2
+2020.09.01 17:15:07 [debg] [sess] + 8f7ed46a:1 = 1
+2020.09.01 17:15:07 [info] [sock] + google.com:443 = 1
+2020.09.01 17:15:12 [erro] [conn] - 8f7ed46a = 1 unexpected EOF
+2020.09.01 17:15:12 [debg] [sess] - 8f7ed46a:1 = 0
+2020.09.01 17:15:12 [info] [sock] - google.com:443 = 0
+2020.09.01 17:15:39 [info] [conn] - 3905e1ca = 0
 ```
-* 日志均由Client记录
 
 ## 数据格式
 ```
@@ -81,4 +83,48 @@ Session编号  数据长度  数据
 
 ## 调度策略
 * 当原有连接不可用时才建立新的连接
-* 连接和Session均由Client管理
+
+## 有限状态机
+### TLS->SOCKS
+```
+socks <-
+        \
+socks <-- [buf] <- tls
+        /
+socks <-
+```
+* 读tls
+    * 若tls读出错
+        * conn.close()
+* 写socks
+    * 若socks写出错
+        * sess.close(), 这样socks也会读出错, 由读来往tls里写0
+
+### SOCKS->TLS
+```
+socks -> [buf] -
+                \
+socks -> [buf] --> tls
+                /
+socks -> [buf] -
+```
+* 读socks
+    * 若socks读出错
+        * 往tls里写0关闭
+        * sess.close()
+* 写tls
+    * 需要加锁，防止一边写一边关
+    * 若tls写出错
+        * conn.close()
+
+### 函数细节
+* sess.write()
+    * 和sess.close()同步，防止一边写一边关
+* conn.closeSess()
+    * 关掉sess的lowerConn，但不会往tls写0，由sess读线程负责写0
+    * 保证只会执行一次
+* conn.close()
+    * 调用所有的sess.close()
+    * 关掉conn的lowerConn，但不会往tls写0
+    * 因为只有conn出错或没有sess了才需要close，conn出错的话对面也能感知到
+    * 保证只会执行一次
