@@ -25,8 +25,8 @@ const (
 var (
 	flagLogLevel    = flag.String("sla.log.level", "info", "may be from \"debug\" to \"fatal\", or integer in [0, 999]")
 	flagLogDir      = flag.String("sla.log.dir", "", "log file dir. a blank value means logging to stderr only")
-	flagLogRollLine = flag.Int("sla.log.roll.line", 65536, "max number of lines per log file. a negative value means no limit")
-	flagLogRollResv = flag.Int("sla.log.roll.resv", 16, "max number of files to reserve. a negative value means no limit")
+	flagLogRollLine = flag.Int("sla.log.roll.line", 0, "max number of lines per log file. a value < 1 means no limit")
+	flagLogRollResv = flag.Int("sla.log.roll.resv", 0, "max number of files to reserve. a value < 1 means no limit")
 
 	logLevel          = INFO
 	logTimeFormat     = "2006-01-02 15:04:05"
@@ -41,8 +41,8 @@ func Init() {
 	// create log file
 	if len(*flagLogDir) != 0 {
 		if err := rollLog(); err != nil {
-			fmt.Fprintf(os.Stderr, "cannot create log file: %s\n", err.Error())
-			os.Exit(1)
+			// print to stderr only
+			Fatal("cannot create log file: %s\n", err.Error())
 		}
 	}
 
@@ -61,18 +61,12 @@ func Init() {
 	default:
 		level, err := strconv.Atoi(*flagLogLevel)
 		if err != nil {
-			commonLog("fata", "cannot parse sla.log.level: %s", *flagLogLevel)
-			os.Exit(1)
+			Fatal("cannot parse sla.log.level: %s", *flagLogLevel)
 		}
 		if level < 0 || level > 999 {
-			commonLog("fata", "sla.log.level must be in [0, 999], now: %d", level)
-			os.Exit(1)
+			Fatal("sla.log.level must be in [0, 999], now: %d", level)
 		}
 		logLevel = LogLevel(level)
-	}
-
-	if *flagLogRollResv < 0 {
-		Fatal("sla.log.roll.resv should be ")
 	}
 }
 
@@ -112,84 +106,92 @@ func commonLog(level, format string, a ...interface{}) {
 	t := time.Now().Format(logTimeFormat)
 	line := fmt.Sprintf("%s [%s] %s\n", t, level, msg)
 
-	if len(*flagLogDir) != 0 {
-		rollMutex.Lock()
-		if logLine >= *flagLogRollLine {
-			rollLog()
-			logLine = 0
+	if logFile != nil {
+		if *flagLogRollLine > 0 {
+			// TODO: may cause a long wait
+			rollMutex.Lock()
+			logLine++
+
+			// need rolling
+			if logLine > *flagLogRollLine {
+				err := rollLog()
+				if err != nil {
+					// if rollLog fails, use stderr from now on
+					logFile = nil
+					Warn("cannot roll log. use stderr from now on: %s", err.Error())
+				} else {
+					logLine = 1
+				}
+			}
+			rollMutex.Unlock()
 		}
-		logLine++
-		rollMutex.Unlock()
 		fmt.Fprint(logFile, line)
 	}
 
-	fmt.Print(line)
+	fmt.Fprintf(os.Stderr, line)
 }
 
-type strArr []string
+type timeArr []time.Time
 
-func (s strArr) Len() int {
-	return len(s)
+func (a timeArr) Len() int {
+	return len(a)
 }
 
-func (s strArr) Less(i, j int) bool {
-	return s[i] < s[j]
+func (a timeArr) Less(i, j int) bool {
+	return a[i].Before(a[j])
 }
 
-func (s strArr) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
+func (a timeArr) Swap(i, j int) {
+	a[i], a[j] = a[j], a[i]
 }
 
-// rollLog delete obsolete log file(s) and create a new log file
+// rollLog deletes obsolete log files and replaces logFile with a new one.
+// It will not print any logs, but return an error when rolling cannot be
+// done
 func rollLog() error {
-	logDir, err := filepath.Abs(*flagLogDir)
-	if nil != err {
-		return err
-	}
+	if *flagLogRollResv > 0 {
+		fileInfos, err := ioutil.ReadDir(*flagLogDir)
+		if nil != err {
+			return err
+		}
+		fileTimes := make(timeArr, 0, len(fileInfos))
 
-	fis, err := ioutil.ReadDir(logDir)
-	if nil != err {
-		return err
-	}
-
-	fns := make(strArr, 0, len(fis))
-
-	for _, fi := range fis {
-		if fi.IsDir() {
-			continue
+		// find all files that match log file name
+		for _, fi := range fileInfos {
+			if fi.IsDir() {
+				continue
+			}
+			fn := fi.Name()
+			if len(fn) != 19 || fn[:4] != "log_" {
+				continue
+			}
+			t, err := time.Parse(logFileTimeFormat, fn[4:])
+			if err != nil {
+				continue
+			}
+			fileTimes = append(fileTimes, t)
 		}
 
-		// match file name
-		fn := fi.Name()
-		if len(fn) != 19 {
-			continue
-		}
-		if fn[:4] != "log_" {
-			continue
-		}
-		_, err := time.Parse(logFileTimeFormat, fn[4:])
-		if err != nil {
-			continue
-		}
-		fns = append(fns, fn)
-	}
+		if len(fileTimes) >= *flagLogRollResv {
+			// sort by timestamp in file name
+			sort.Sort(fileTimes)
 
-	if len(fns) < *flagLogRollResv {
-		return nil
-	}
-
-	// sort by timestamp in file name
-	sort.Sort(fns)
-
-	for i := 0; i+*flagLogRollResv <= len(fns); i++ {
-		os.Remove(filepath.Join(*flagLogDir, fns[i]))
+			// delete anyway. Don't care if some files have been deleted
+			for i := 0; len(fileTimes)-i >= *flagLogRollResv; i++ {
+				fn := "log_" + fileTimes[i].Format(logFileTimeFormat)
+				os.Remove(filepath.Join(*flagLogDir, fn))
+			}
+		}
 	}
 
 	// create new log file
-	fn := fmt.Sprintf("log_%s", time.Now().Format(logFileTimeFormat))
+	fn := "log_" + time.Now().Format(logFileTimeFormat)
 	newLogFile, err := os.Create(filepath.Join(*flagLogDir, fn))
 	if err != nil {
 		return err
+	}
+	if logFile != nil {
+		logFile.Close()
 	}
 	logFile = newLogFile
 
